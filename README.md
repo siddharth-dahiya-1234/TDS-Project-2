@@ -2,7 +2,7 @@
 # 🌟 **TDS Project 2: Data Analyst Agent**
 
 > **A smart, interactive, and beautiful way to analyze your data — powered by Google Generative AI & cutting-edge Python tools.**
-> **Repo:** [📂 View on GitHub](https://github.com/23f1000805/tds-project-2)
+> **Repo:** [📂 View on GitHub](https://github.com/siddharth-dahiya-1234/tds-project-2)
 
 ---
 
