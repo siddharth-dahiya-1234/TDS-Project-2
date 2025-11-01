@@ -138,7 +138,7 @@ Then open **[http://localhost:8000](http://localhost:8000)** in your browser.
 
 ## 🤝 **Contributing**
 
-We welcome PRs!
+I welcome PRs!
 
 1. Fork the repo
 2. Create a branch: `git checkout -b feature-name`
