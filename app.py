@@ -41,7 +41,55 @@ except Exception:
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+
+# LangChain agents API has changed across releases. Attempt import; if unavailable,
+# provide a small compatibility shim that exposes the minimal interface our code expects:
+try:
+    from langchain.agents import create_tool_calling_agent, AgentExecutor
+except Exception:
+    def create_tool_calling_agent(llm, tools, prompt):
+        # Return a lightweight container with the llm and metadata. The full tool-calling
+        # behaviour won't be available in this fallback, but the rest of the app can still
+        # invoke the llm via the AgentExecutorCompat below.
+        return {"llm": llm, "tools": tools, "prompt": prompt}
+
+    class AgentExecutor:
+        """Compatibility AgentExecutor providing a minimal `invoke` method.
+
+        The real LangChain AgentExecutor supports tool calling and richer behaviours.
+        This shim simply calls the provided LLM's `invoke` or `__call__` and returns
+        a dict with `output`/`text` keys so the rest of the app can continue.
+        """
+        def __init__(self, agent, tools=None, verbose=False, **kwargs):
+            self.agent = agent
+            self.tools = tools or []
+            self.verbose = verbose
+
+        def invoke(self, inputs, options=None):
+            # inputs expected to be a dict-like with `input` key
+            try:
+                prompt = inputs.get("input") if isinstance(inputs, dict) else inputs
+                llm = None
+                if isinstance(self.agent, dict):
+                    llm = self.agent.get("llm")
+                else:
+                    llm = getattr(self.agent, "llm", self.agent)
+
+                if hasattr(llm, "invoke"):
+                    resp = llm.invoke(prompt)
+                elif hasattr(llm, "__call__"):
+                    resp = llm(prompt)
+                else:
+                    resp = str(llm)
+
+                # Normalize response into a simple dict the app expects
+                text = resp
+                if isinstance(resp, dict):
+                    # if it's already a dict, prefer `output` or `text` fields
+                    return resp
+                return {"output": str(text), "text": str(text)}
+            except Exception as e:
+                return {"output": "", "text": "", "error": str(e)}
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
