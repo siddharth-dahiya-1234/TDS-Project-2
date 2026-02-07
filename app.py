@@ -22,7 +22,6 @@ from typing import Dict, Any, List
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi import FastAPI
 from dotenv import load_dotenv
 
 import requests
@@ -41,55 +40,7 @@ except Exception:
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
-
-# LangChain agents API has changed across releases. Attempt import; if unavailable,
-# provide a small compatibility shim that exposes the minimal interface our code expects:
-try:
-    from langchain.agents import create_tool_calling_agent, AgentExecutor
-except Exception:
-    def create_tool_calling_agent(llm, tools, prompt):
-        # Return a lightweight container with the llm and metadata. The full tool-calling
-        # behaviour won't be available in this fallback, but the rest of the app can still
-        # invoke the llm via the AgentExecutorCompat below.
-        return {"llm": llm, "tools": tools, "prompt": prompt}
-
-    class AgentExecutor:
-        """Compatibility AgentExecutor providing a minimal `invoke` method.
-
-        The real LangChain AgentExecutor supports tool calling and richer behaviours.
-        This shim simply calls the provided LLM's `invoke` or `__call__` and returns
-        a dict with `output`/`text` keys so the rest of the app can continue.
-        """
-        def __init__(self, agent, tools=None, verbose=False, **kwargs):
-            self.agent = agent
-            self.tools = tools or []
-            self.verbose = verbose
-
-        def invoke(self, inputs, options=None):
-            # inputs expected to be a dict-like with `input` key
-            try:
-                prompt = inputs.get("input") if isinstance(inputs, dict) else inputs
-                llm = None
-                if isinstance(self.agent, dict):
-                    llm = self.agent.get("llm")
-                else:
-                    llm = getattr(self.agent, "llm", self.agent)
-
-                if hasattr(llm, "invoke"):
-                    resp = llm.invoke(prompt)
-                elif hasattr(llm, "__call__"):
-                    resp = llm(prompt)
-                else:
-                    resp = str(llm)
-
-                # Normalize response into a simple dict the app expects
-                text = resp
-                if isinstance(resp, dict):
-                    # if it's already a dict, prefer `output` or `text` fields
-                    return resp
-                return {"output": str(text), "text": str(text)}
-            except Exception as e:
-                return {"output": "", "text": "", "error": str(e)}
+from langchain.agents import create_tool_calling_agent, AgentExecutor
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -107,7 +58,6 @@ GEMINI_KEYS = [os.getenv(f"gemini_api_{i}") for i in range(1, 11)]
 GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 
 MODEL_HIERARCHY = [
-    "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
@@ -720,24 +670,19 @@ async def analyze_data(request: Request):
         if "error" in result:
             raise HTTPException(500, detail=result["error"])
 
-        # Post-process key mapping & type casting
-        if keys_list and type_map:
-            mapped = {}
-            for idx, q in enumerate(result.keys()):
-                if idx < len(keys_list):
-                    key = keys_list[idx]
-                    caster = type_map.get(key, str)
-                    try:
-                        val = result[q]
-                        if isinstance(val, str) and val.startswith("data:image/"):
-                            # Remove data URI prefix
-                            val = val.split(",", 1)[1] if "," in val else val
-                        mapped[key] = caster(val) if val not in (None, "") else val
-                    except Exception:
-                        mapped[key] = result[q]
-            result = mapped
-
-        return JSONResponse(content=result)
+        # Simple cleanup for image data if needed
+        cleaned_result = {}
+        for question, answer in result.items():
+            # Ensure image data has proper data URI prefix
+            if isinstance(answer, str) and answer.startswith("iVBOR") and len(answer) > 100:
+                # Looks like base64 without prefix
+                cleaned_result[question] = f"data:image/png;base64,{answer}"
+            elif isinstance(answer, str) and "base64" in answer and not answer.startswith("data:image/"):
+                cleaned_result[question] = f"data:image/png;base64,{answer}"
+            else:
+                cleaned_result[question] = answer
+        
+        return JSONResponse(content=cleaned_result)
 
     except HTTPException as he:
         raise he
@@ -792,7 +737,54 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
             return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
 
         results_dict = exec_result.get("result", {})
-        return {q: results_dict.get(q, "Answer not found") for q in questions}
+        
+        # ✅ CRITICAL FIX: Map answers back to original questions
+        # The agent's code creates results dict with generic keys, but frontend needs question texts
+        output = {}
+        
+        # First try: Check if results_dict already uses question texts as keys
+        if any(q in results_dict for q in questions):
+            for q in questions:
+                if q in results_dict:
+                    output[q] = results_dict[q]
+                else:
+                    output[q] = "Answer not found"
+        
+        # Second try: Map by position if same length
+        elif len(results_dict) == len(questions):
+            result_items = list(results_dict.items())
+            for i, q in enumerate(questions):
+                if i < len(result_items):
+                    output[q] = result_items[i][1]
+                else:
+                    output[q] = "Answer not found"
+        
+        # Third try: Try to match based on content
+        else:
+            # Try to intelligently match questions to results
+            for q in questions:
+                output[q] = "Answer not found"
+            
+            # Use all available results
+            available_results = list(results_dict.values())
+            for i, q in enumerate(questions):
+                if i < len(available_results):
+                    output[q] = available_results[i]
+            
+            # If still not matched, try to find by keyword matching
+            for q in questions:
+                if output[q] == "Answer not found":
+                    # Look for keys in results_dict that might match question content
+                    for key, value in results_dict.items():
+                        key_lower = str(key).lower()
+                        q_lower = q.lower()
+                        # Check for common keywords
+                        if any(word in key_lower and word in q_lower 
+                               for word in ['average', 'min', 'max', 'correlation', 'plot', 'chart', 'histogram']):
+                            output[q] = value
+                            break
+        
+        return output
 
     except Exception as e:
         logger.exception("run_agent_safely_unified failed")
@@ -1164,4 +1156,3 @@ async def diagnose(full: bool = Query(False, description="If true, run extended 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
